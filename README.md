@@ -1,4 +1,239 @@
-# Ml excel Analyzer
+# ML Excel Analyzer — Architecture Overview
+
+This document explains the system architecture using C4-style diagrams, key sequences, a database schema (current and proposed), and the API surface including authentication and authorization considerations.
+
+## Context Diagram (C4 Level 1)
+
+```mermaid
+flowchart LR
+    user[End User] -- Uploads Excel & views results --> system[ML Excel Analyzer]
+    subgraph External Services
+      none[(None)]
+    end
+    system -- Renders UI --> user
+```
+
+Scope: A single product used by an end user. No third-party integrations at present.
+
+## Container Diagram (C4 Level 2)
+
+```mermaid
+flowchart LR
+    subgraph Browser
+      FE[React (Vite) Frontend]
+    end
+    subgraph Server
+      BE[Flask API Backend]
+      UP[(uploads/)]
+      MEM[(In-memory status & results)]
+    end
+
+    FE <--->|HTTP/JSON via /api (Vite proxy)| BE
+    BE -->|stores files| UP
+    BE -->|stores analysis_status & analysis_results| MEM
+```
+
+- Frontend: React app built with Vite; calls `/api/*` endpoints.
+- Backend: Flask app (`app.py`) exposes REST endpoints for upload, analysis, status, and results. CORS enabled.
+- Storage: Files saved on disk under `uploads/`; analysis state and results kept in memory. No database yet.
+
+## Sequence Diagrams (Major Scenarios)
+
+### 1) End-to-End Analysis (Upload → Analyze → Poll → Results)
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant FE as Frontend (React)
+  participant BE as Backend (Flask)
+  participant FS as File Store (uploads/)
+
+  U->>FE: Select .xls/.xlsx & click Analyze
+  FE->>BE: POST /api/upload (multipart/form-data)
+  BE->>FS: Save file to uploads/
+  BE-->>FE: { file_id, status: uploaded }
+
+  FE->>BE: POST /api/analyze { file_id }
+  BE->>BE: Read file, clean data, run ML, build insights
+  BE-->>FE: { analysis_id, status: analyzing }
+
+  loop Polling every 5s
+    FE->>BE: GET /api/status/{file_id}
+    BE-->>FE: { status: analyzing | completed | failed }
+  end
+
+  FE->>BE: GET /api/results/{analysis_id}
+  BE-->>FE: { data_cleaning, ml_results, data_summary, insights }
+  FE->>U: Render dashboard
+```
+
+Notes: In current implementation, analysis runs during the `/api/analyze` call (no background worker). Status flips to `completed` when results are ready.
+
+### 2) Health Check
+
+```mermaid
+sequenceDiagram
+  participant FE as Frontend
+  participant BE as Backend
+  FE->>BE: GET /api/health
+  BE-->>FE: { status: "healthy" }
+```
+
+### 3) Error Path (Invalid File Type)
+
+```mermaid
+sequenceDiagram
+  participant FE as Frontend
+  participant BE as Backend
+  participant U as User
+  U->>FE: Upload .csv (invalid)
+  FE->>BE: POST /api/upload (multipart/form-data)
+  BE-->>FE: 400 { error: "Only .xls and .xlsx files are supported" }
+  FE->>U: Show error message
+```
+
+## ERD / Database Schema
+
+Current state: No database is used. The backend keeps `analysis_status` and `analysis_results` in memory and stores uploaded files on disk under `uploads/`.
+
+Proposed relational schema (if/when persistence is needed):
+
+```mermaid
+erDiagram
+  USERS ||--o{ FILES : uploads
+  USERS {
+    uuid id PK
+    string email
+    string name
+    string role  // admin|user
+  }
+
+  FILES ||--o{ ANALYSES : source
+  FILES {
+    uuid id PK
+    uuid user_id FK
+    string original_filename
+    string stored_path
+    datetime uploaded_at
+    int size_bytes
+    string mime_type
+  }
+
+  ANALYSES {
+    uuid id PK
+    uuid file_id FK
+    string status   // uploaded|analyzing|completed|failed
+    datetime started_at
+    datetime completed_at
+    text error_message
+  }
+
+  RESULTS {
+    uuid id PK
+    uuid analysis_id FK
+    json data_cleaning
+    json ml_results
+    json data_summary
+    json insights
+    datetime created_at
+  }
+```
+
+This schema mirrors the current flow while enabling persistence, multi-user support, and auditability.
+
+## API Endpoints
+
+Base URL (dev): `http://localhost:5000` (Vite proxies `/api` to backend)
+
+- `GET /api/health`
+  - Purpose: Check backend availability.
+  - Response: `{ status: "healthy", message: "Backend is running" }`
+  - Auth: None (dev). In production, public or restricted per ops policy.
+
+- `POST /api/upload`
+  - Purpose: Upload an Excel file (`.xls` or `.xlsx` up to 100MB).
+  - Request: `multipart/form-data` with `file`.
+  - Success 200: `{ file_id: string, message: string, status: "uploaded", filename: string }`
+  - Errors: `400` (missing/invalid file), `500` (server error).
+  - Auth: None (dev). In production, require authenticated user.
+  - Authorization: Any authenticated user (recommended). Optional quotas per role.
+
+- `POST /api/analyze`
+  - Purpose: Start cleaning and ML analysis for a previously uploaded file.
+  - Request: JSON `{ file_id: string }`
+  - Success 200: `{ analysis_id: string, message: string, status: "analyzing" }`
+  - Errors: `400` (missing file_id), `404` (file not found), `500` (analysis start error).
+  - Auth: None (dev). In production, require authenticated user.
+  - Authorization: Only owner of the `file_id` or admins (recommended).
+
+- `GET /api/status/{file_id}`
+  - Purpose: Check analysis status for the uploaded file.
+  - Response: `{ status: "uploaded" | "analyzing" | "completed" | "failed" }`
+  - Errors: `404` (file not found).
+  - Auth: None (dev). In production, require authenticated user.
+  - Authorization: File owner or admins (recommended).
+
+- `GET /api/results/{analysis_id}`
+  - Purpose: Retrieve final results of an analysis.
+  - Response: `{ data_cleaning, ml_results, data_summary, insights }`
+  - Errors: `404` (analysis_id not found), `500` (serialization).
+  - Auth: None (dev). In production, require authenticated user.
+  - Authorization: Analysis owner or admins (recommended).
+
+### Request/Response Structures
+
+Types used in frontend (`src/types.ts`):
+
+```ts
+export interface UploadResponse {
+  file_id: string;
+  message: string;
+  status: string;
+}
+
+export interface AnalysisResult {
+  data_cleaning: {
+    original_rows: number;
+    cleaned_rows: number;
+    missing_values: number;
+    duplicates_removed: number;
+    null_values: number;
+  };
+  ml_results: {
+    [key: string]: {
+      accuracy?: number;
+      precision?: number;
+      recall?: number;
+      f1_score?: number;
+      mse?: number;
+      r2?: number;
+      algorithm: string;
+      type: 'classification' | 'regression' | 'clustering';
+    };
+  };
+  data_summary: {
+    columns: string[];
+    data_types: { [key: string]: string };
+    descriptive_stats: { [key: string]: any };
+    correlations: { [key: string]: number }[];
+  };
+  insights: string[];
+}
+```
+
+### Authentication & Authorization
+
+- Current: No authentication/authorization implemented; CORS is open for local dev.
+- Recommended:
+  - Authentication: JWT-based sessions (e.g., `Authorization: Bearer <token>`).
+  - Authorization: Role-based access control (`admin`, `user`).
+  - Data ownership: Enforce that `file_id` and `analysis_id` are accessible only by the uploading user or admins.
+  - CORS: Restrict allowed origins to the deployed frontend domain.
+
+## Dev Proxy
+
+Vite dev server proxies `/api` to `http://localhost:5000` (`vite.config.ts`), so frontend can call relative paths like `/api/upload` during development.
+
 # 🚀 XLS File Analyzer - Professional Data Analysis Platform
 
 A comprehensive full-stack web application for automated Excel file analysis with 15+ machine learning algorithms, data cleaning, and interactive dashboard visualization.
